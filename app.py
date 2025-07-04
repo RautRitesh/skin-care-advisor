@@ -1,5 +1,5 @@
 # ===================================================================
-# FILE: app.py (Flask Backend) - Updated Version
+# FILE: app.py (Flask Backend) - Simplified Version (No Slicing)
 # ===================================================================
 from flask import Flask, request, jsonify, render_template
 import tensorflow as tf
@@ -8,215 +8,146 @@ import cv2
 import dlib
 from PIL import Image
 import io
-from collections import Counter
 import os
+import base64 # For encoding the image to send back
 
 # --- Supress TensorFlow INFO and WARNING messages ---
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 # --- 1. INITIALIZE FLASK APP ---
-
 app = Flask(__name__)
 
-# --- Define Model Configuration (Matches your training data) ---
+# --- Define Model Configuration ---
 MODEL_IMG_SIZE = (224, 224) 
-CLASS_LABELS = ['dry', 'oily', 'normal'] # IMPORTANT: Must match the sub-directory order in your train/test folders
+CLASS_LABELS = ['dry', 'normal', 'oily'] 
 
 # ===================================================================
-# --- MODEL LOADING ---
+# --- MODEL AND DLIB LOADING ---
 # ===================================================================
-
-# --- Load the Model and Trained Weights ---
+model = None
 try:
-    # When loading a full model from a .h5 file, you don't need to load the weights separately.
-    # The .h5 file created by model.save() already contains the weights.
-    # The custom_objects dictionary is needed to tell TensorFlow how to load the augmentation layers.
-    custom_objects={
-        'RandomFlip':tf.keras.layers.RandomFlip,
-        'RandomRotation':tf.keras.layers.RandomRotation,
-        'RandomZoom':tf.keras.layers.RandomZoom,
-        'RandomContrast':tf.keras.layers.RandomContrast
-    }
-    model = tf.keras.models.load_model(
-        "skin_type_classifier_finale.h5", # This file should contain the full model
-        custom_objects=custom_objects,
-        compile=False
-    )
-    print("✅ Full model and weights loaded successfully.")
-    
+    # Ensure your model file is named correctly
+    model = tf.keras.models.load_model("last_final_2.keras")
+    print("✅ Model loaded successfully.")
 except Exception as e:
-    print(f"❌ FATAL: Could not build model or load weights. Error: {e}")
-    model = None
+    print(f"❌ FATAL: Could not load model. Error: {e}")
 
-# ===================================================================
-# --- DLIB SETUP ---
-# ===================================================================
-
-# --- Load Dlib for face processing ---
+detector = None
+predictor = None
 try:
     detector = dlib.get_frontal_face_detector()
     predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
-    print("✅ Dlib face detector and predictor loaded successfully.")
+    print("✅ Dlib components loaded successfully.")
 except Exception as e:
-    print(f"❌ FATAL: Could not load 'shape_predictor_68_face_landmarks.dat'. Error: {e}")
-    detector = None
-    predictor = None
+    print(f"❌ FATAL: Could not load dlib components. Error: {e}")
 
 # ===================================================================
-# --- HELPER AND PREDICTION FUNCTIONS ---
+# --- HELPER, ENHANCEMENT, AND PREDICTION FUNCTIONS ---
 # ===================================================================
 
-def preprocess_image_for_prediction(image_bytes):
-    """Takes image bytes, converts to a NumPy array for processing."""
+def preprocess_upload(image_bytes):
+    """Takes uploaded image bytes and prepares them as a CV2 image."""
     pil_image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
     cv_image = np.array(pil_image)
     # Convert RGB (from PIL) to BGR (for OpenCV)
     return cv_image[:, :, ::-1].copy()
 
-# --- START: NEW, MORE ROBUST FACE SLICING FUNCTION ---
-def get_face_slices_for_prediction(cv_image, debug=False):
-    """
-    Finds a face in an image and returns cropped regions. This version is more
-    robust and less strict about finding every single region.
-    """
-    if detector is None or predictor is None:
-        return {'error': 'Face detector models are not loaded.'}
-
-    debug_image = cv_image.copy() if debug else None
-    gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-    rects = detector(gray, 1)
-
-    if not rects:
-        print("⚠️ Dlib face detector did not find a face.")
-        return {'error': 'Face not found. Please use a photo with a clear, front-facing view.'}
-
-    rect = rects[0]
-    shape = predictor(gray, rect)
-    landmarks = np.array([[p.x, p.y] for p in shape.parts()])
-    
-    slices = {}
-
-    def is_slice_valid(slice_img):
-        return slice_img is not None and slice_img.size > 0 and slice_img.shape[0] > 10 and slice_img.shape[1] > 10
-
+def enhance_full_face(cv_image, shape):
+    """Applies cosmetic enhancement to the entire face region."""
     try:
-        # Left Cheek: Get bounding box around the key landmarks. This is more robust.
-        cheek_pts = landmarks[1:5] # Points along the curve of the left cheek
-        x, y, w, h = cv2.boundingRect(cheek_pts)
-        if w > 10 and h > 10: # Ensure the box has a reasonable size
-            left_cheek_crop = cv_image[y:y+h, x:x+w]
-            slices["left_cheek"] = left_cheek_crop
-            if debug: cv2.rectangle(debug_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
-
-        # Right Cheek: Use the same robust bounding box method.
-        cheek_pts = landmarks[12:16] # Points along the curve of the right cheek
-        x, y, w, h = cv2.boundingRect(cheek_pts)
-        if w > 10 and h > 10:
-            right_cheek_crop = cv_image[y:y+h, x:x+w]
-            slices["right_cheek"] = right_cheek_crop
-            if debug: cv2.rectangle(debug_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
-
-        # Forehead
-        eyebrow_left = landmarks[17]
-        eyebrow_right = landmarks[26]
-        eyebrow_top = min(landmarks[19][1], landmarks[24][1])
-        face_height = rect.bottom() - rect.top()
-        forehead_height = int(face_height * 0.25)
-        y1, y2 = max(0, eyebrow_top - forehead_height), eyebrow_top
-        x1, x2 = eyebrow_left[0], eyebrow_right[0]
-        if y2 > y1 and x2 > x1:
-            forehead_crop = cv_image[y1:y2, x1:x2]
-            if is_slice_valid(forehead_crop):
-                slices["forehead"] = forehead_crop
-                if debug: cv2.rectangle(debug_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-        # T-Zone / Nose
-        y1, y2 = landmarks[27][1], landmarks[33][1]
-        x1, x2 = landmarks[31][0], landmarks[35][0]
-        if y2 > y1 and x2 > x1:
-            t_zone_crop = cv_image[y1:y2, x1:x2]
-            if is_slice_valid(t_zone_crop):
-                slices["t_zone"] = t_zone_crop
-                if debug: cv2.rectangle(debug_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
+        points = np.array([[p.x, p.y] for p in shape.parts()])
+        face_hull = cv2.convexHull(points)
+        
+        mask = np.zeros(cv_image.shape[:2], dtype=np.uint8)
+        cv2.fillConvexPoly(mask, face_hull, 255)
+        
+        # Dilate the mask to ensure the whole face is covered smoothly
+        kernel_size = 21
+        mask = cv2.dilate(mask, np.ones((kernel_size, kernel_size), np.uint8), iterations=1)
+        
+        # Blur the background
+        blurred_background = cv2.GaussianBlur(cv_image, (kernel_size, kernel_size), 0)
+        
+        # Apply filters only to the face area for enhancement
+        denoised_face = cv2.bilateralFilter(cv_image, d=9, sigmaColor=75, sigmaSpace=75)
+        
+        lab = cv2.cvtColor(denoised_face, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        clahe_l = clahe.apply(l)
+        enhanced_lab = cv2.merge((clahe_l, a, b))
+        contrast_enhanced = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
+        
+        blurred_sharp = cv2.GaussianBlur(contrast_enhanced, (5, 5), 0)
+        sharpened_face = cv2.addWeighted(contrast_enhanced, 1.5, blurred_sharp, -0.5, 0)
+        
+        # Combine the enhanced face with the blurred background
+        final_image = np.where(cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR) > 0, sharpened_face, blurred_background)
+        return final_image
     except Exception as e:
-        print(f"⚠️ Warning: An exception occurred during slicing. Error: {e}")
-        # Even if one part fails, we still return what we found.
-
-    if debug:
-        for (x, y) in landmarks:
-            cv2.circle(debug_image, (x, y), 2, (0, 0, 255), -1)
-        cv2.imwrite("debug_output.jpg", debug_image)
-        print("ℹ️ Saved debug image to 'debug_output.jpg'")
-
-    if not slices:
-        return {'error': 'Could not extract any valid facial regions even though a face was detected.'}
-
-    return slices
-# --- END: NEW FACE SLICING FUNCTION ---
-
+        print(f"⚠️ Warning: Could not apply enhancement. Error: {e}")
+        return cv_image # Return original on failure
 
 def predict_skin_type(image_bytes):
-    """Main prediction pipeline that processes an image and returns results."""
-    if model is None: return {"error": "Model is not loaded. Please check server logs."}
+    """Main pipeline: validates face, enhances, and predicts."""
+    if model is None: return {"error": "Model is not loaded."}
+    if detector is None: return {"error": "Face detector is not loaded."}
     
-    cv_image = preprocess_image_for_prediction(image_bytes)
+    cv_image = preprocess_upload(image_bytes)
     
-    # To debug a failing image, change debug=False to debug=True
-    slices = get_face_slices_for_prediction(cv_image, debug=False)
-    
-    if 'error' in slices:
-        return slices
-    
-    if not slices: 
-        return {"error": "Could not detect any facial regions. Please use a clear, well-lit, front-facing photo."}
+    # --- Step 1: Face Detection (Validation) ---
+    gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+    rects = detector(gray, 1)
+    if not rects:
+        return {'error': 'Face not found. Please use a photo with a clear, front-facing view.'}
+    shape = predictor(gray, rects[0])
 
-    region_predictions, all_predictions = {}, []
+    # --- Step 2: Enhance the full face ---
+    enhanced_image = enhance_full_face(cv_image, shape)
     
-    for region_name, region_img in slices.items():
-        img_resized = cv2.resize(region_img, MODEL_IMG_SIZE)
-        img_array = tf.keras.preprocessing.image.img_to_array(img_resized)
-        img_array = np.expand_dims(img_array, axis=0)
-        img_array = tf.keras.applications.efficientnet.preprocess_input(img_array)
-
-        prediction_scores = model.predict(img_array, verbose=0)[0]
-        predicted_index = np.argmax(prediction_scores)
-        predicted_label = CLASS_LABELS[predicted_index]
-        confidence = float(np.max(prediction_scores))
-        
-        region_predictions[region_name] = {"prediction": predicted_label, "confidence": round(confidence, 4)}
-        all_predictions.append(predicted_label)
-
-    # Be more forgiving: require at least 2 regions to make a prediction
-    if len(all_predictions) < 2: 
-        return {"error": f"Analysis Incomplete. Only found {len(all_predictions)} region(s). Please use a clearer photo."}
-
-    prediction_counts = Counter(all_predictions)
+    # --- Step 3: Preprocess the enhanced image for the model ---
+    # This preprocessing pipeline should exactly match your training script
+    gray_enhanced = cv2.cvtColor(enhanced_image, cv2.COLOR_BGR2GRAY)
+    img_resized = cv2.resize(gray_enhanced, MODEL_IMG_SIZE)
     
-    if 'oily' in prediction_counts and 'dry' in prediction_counts:
-        overall_prediction = 'Combination'
-    else:
-        overall_prediction = prediction_counts.most_common(1)[0][0]
+    img_tensor = tf.convert_to_tensor(img_resized)
+    img_tensor = tf.expand_dims(img_tensor, axis=-1)
+    img_rgb = tf.image.grayscale_to_rgb(img_tensor) # Duplicate gray channel to 3 channels
+    
+    img_batch = tf.expand_dims(img_rgb, axis=0)
+    img_batch_float = tf.cast(img_batch, tf.float32)
+    img_preprocessed = tf.keras.applications.densenet.preprocess_input(img_batch_float)
+    
+    # --- Step 4: Make the Prediction ---
+    prediction_scores = model.predict(img_preprocessed, verbose=0)[0]
+    predicted_index = np.argmax(prediction_scores)
+    prediction_label = CLASS_LABELS[predicted_index]
+    confidence = float(np.max(prediction_scores))
+    
+    # --- Step 5: Prepare final response ---
+    # Encode the enhanced image to send back for display
+    _, buffer = cv2.imencode('.jpg', enhanced_image)
+    enhanced_image_b64 = base64.b64encode(buffer).decode('utf-8')
 
     return {
         "status": "success",
-        "overall_prediction": overall_prediction,
-        "region_predictions": region_predictions
+        "prediction": prediction_label,
+        "confidence": round(confidence, 4),
+        "enhanced_image_b64": enhanced_image_b64
     }
 
 # ===================================================================
 # --- FLASK ROUTES ---
 # ===================================================================
-
 @app.route('/')
 def index():
     return render_template('index.html')
 
 @app.route('/predict', methods=['POST'])
 def handle_prediction():
-    if 'file' not in request.files: return jsonify({"error": "No file part in the request"}), 400
+    if 'file' not in request.files: return jsonify({"error": "No file part"}), 400
     file = request.files['file']
-    if file.filename == '': return jsonify({"error": "No file selected for uploading"}), 400
+    if file.filename == '': return jsonify({"error": "No file selected"}), 400
     
     try:
         image_bytes = file.read()
